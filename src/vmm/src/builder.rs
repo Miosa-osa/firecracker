@@ -39,9 +39,7 @@ use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
 #[cfg(feature = "gdb")]
 use crate::gdb;
 use crate::initrd::{InitrdConfig, InitrdError};
-use crate::logger::debug;
-#[cfg(target_arch = "aarch64")]
-use crate::logger::warn;
+use crate::logger::{debug, warn};
 use crate::persist::{MicrovmState, MicrovmStateError};
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
@@ -464,12 +462,53 @@ pub fn build_microvm_from_snapshot(
         }
     }
 
+    // One IA32_TSC for every vCPU: a snapshot whose vCPU threads answered the save
+    // more than a second apart would otherwise restore into a VM whose vCPUs
+    // disagree on the time (see `unify_saved_tsc`).
+    #[cfg(target_arch = "x86_64")]
+    let microvm_state = {
+        let mut microvm_state = microvm_state;
+        let spread = crate::arch::x86_64::vcpu::unify_saved_tsc(&mut microvm_state.vcpu_states);
+        let one_ms = u64::from(microvm_state.vcpu_states[0].tsc_khz.unwrap_or(1_000_000));
+        if spread > one_ms {
+            warn!(
+                "Snapshot vCPU TSCs were saved {spread} cycles apart; restoring every vCPU at the \
+                 largest"
+            );
+        }
+        microvm_state
+    };
+
     // Restore vcpus kvm state.
     for (vcpu, state) in vcpus.iter_mut().zip(microvm_state.vcpu_states.iter()) {
         vcpu.kvm_vcpu
             .restore_state(state)
             .map_err(VcpuError::VcpuResponse)
             .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)?;
+    }
+
+    // Belt and braces for the restore itself: if the IA32_TSC writes above still
+    // landed in different KVM offset generations (the restoring thread stalled for
+    // over a second between two vCPUs), write one TSC to every vCPU back to back.
+    #[cfg(target_arch = "x86_64")]
+    {
+        // One millisecond of TSC cycles; reading every vCPU back to back takes microseconds.
+        let tolerance = u64::from(vcpus[0].kvm_vcpu.get_tsc_khz().unwrap_or(1_000_000));
+        let kvm_vcpus: Vec<&crate::arch::x86_64::vcpu::KvmVcpu> =
+            vcpus.iter().map(|vcpu| &vcpu.kvm_vcpu).collect();
+        let (found, left) = crate::arch::x86_64::vcpu::unify_restored_tsc(
+            &kvm_vcpus,
+            &microvm_state.vcpu_states,
+            tolerance,
+        )
+        .map_err(VcpuError::VcpuResponse)
+        .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)?;
+        if found > tolerance {
+            warn!(
+                "Restored vCPU TSCs were {found} cycles apart; rewrote one TSC to every vCPU, \
+                 {left} cycles apart now"
+            );
+        }
     }
 
     #[cfg(target_arch = "aarch64")]
