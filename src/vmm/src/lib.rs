@@ -511,6 +511,23 @@ impl Vmm {
             .as_kvm()
             .ok_or_else(|| MicrovmStateError::NotAllowed("save_state requires KVM".into()))?;
         let vcpu_states = kvm_vm.save_vcpu_states()?;
+        // Every vCPU thread reads its own IA32_TSC; record one value for all of them
+        // so any restorer, patched or not, gives the vCPUs one KVM TSC offset.
+        #[cfg(target_arch = "x86_64")]
+        let vcpu_states = {
+            let mut vcpu_states = vcpu_states;
+            let spread = crate::arch::x86_64::vcpu::unify_saved_tsc(&mut vcpu_states);
+            let one_ms = u64::from(
+                vcpu_states
+                    .first()
+                    .and_then(|state| state.tsc_khz)
+                    .unwrap_or(1_000_000),
+            );
+            if spread > one_ms {
+                warn!("vCPU TSCs were read {spread} cycles apart while saving; saved the largest");
+            }
+            vcpu_states
+        };
         let kvm_state = kvm_vm.kvm().save_state();
         let vm_state = {
             #[cfg(target_arch = "x86_64")]

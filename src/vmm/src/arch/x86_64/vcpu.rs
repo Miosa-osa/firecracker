@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use kvm_bindings::{
     CpuId, KVM_MAX_CPUID_ENTRIES, KVM_MAX_MSR_ENTRIES, Msrs, Xsave, kvm_debugregs, kvm_lapic_state,
-    kvm_mp_state, kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs, kvm_xsave, kvm_xsave2,
+    kvm_mp_state, kvm_msr_entry, kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs, kvm_xsave,
+    kvm_xsave2,
 };
 use kvm_ioctls::{VcpuExit, VcpuFd};
 use serde::{Deserialize, Serialize};
@@ -748,6 +749,135 @@ impl KvmVcpu {
         self.kvmclock_ctrl();
         Ok(())
     }
+
+    /// This vCPU's current IA32_TSC.
+    pub fn get_tsc(&self) -> Result<u64, KvmVcpuError> {
+        let mut msrs = Msrs::from_entries(&[kvm_msr_entry {
+            index: MSR_IA32_TSC,
+            ..Default::default()
+        }])?;
+        let nmsrs = self
+            .fd
+            .get_msrs(&mut msrs)
+            .map_err(KvmVcpuError::VcpuGetMsrs)?;
+        if nmsrs != 1 {
+            return Err(KvmVcpuError::VcpuGetMsr(MSR_IA32_TSC));
+        }
+        Ok(msrs.as_slice()[0].data)
+    }
+
+    /// Writes `tsc` to this vCPU's IA32_TSC.
+    pub fn set_tsc(&self, tsc: u64) -> Result<(), KvmVcpuError> {
+        self.set_msr_entries(&[kvm_msr_entry {
+            index: MSR_IA32_TSC,
+            data: tsc,
+            ..Default::default()
+        }])
+    }
+
+    /// Writes the deferred MSRs of `state` (IA32_TSC_DEADLINE) again, so a timer
+    /// primed against an earlier IA32_TSC is primed against the current one.
+    pub fn restore_deferred_msrs(&self, state: &VcpuState) -> Result<(), KvmVcpuError> {
+        let deferred: Vec<kvm_msr_entry> = state
+            .saved_msrs
+            .iter()
+            .flat_map(|msrs| msrs.as_slice().iter().copied())
+            .filter(|msr| DEFERRED_MSRS.contains(&msr.index))
+            .collect();
+        if deferred.is_empty() {
+            return Ok(());
+        }
+        self.set_msr_entries(&deferred)
+    }
+
+    fn set_msr_entries(&self, entries: &[kvm_msr_entry]) -> Result<(), KvmVcpuError> {
+        let msrs = Msrs::from_entries(entries)?;
+        let nmsrs = self.fd.set_msrs(&msrs).map_err(KvmVcpuError::VcpuSetMsrs)?;
+        if nmsrs < entries.len() {
+            return Err(KvmVcpuError::VcpuSetMsrsIncomplete);
+        }
+        Ok(())
+    }
+}
+
+/// The IA32_TSC each vCPU state saved, in vCPU order.
+pub fn saved_tscs(states: &[VcpuState]) -> Vec<u64> {
+    states
+        .iter()
+        .flat_map(|state| state.saved_msrs.iter())
+        .flat_map(|msrs| msrs.as_slice().iter())
+        .filter(|msr| msr.index == MSR_IA32_TSC)
+        .map(|msr| msr.data)
+        .collect()
+}
+
+fn spread(values: &[u64]) -> u64 {
+    match (values.iter().min(), values.iter().max()) {
+        (Some(min), Some(max)) => max - min,
+        _ => 0,
+    }
+}
+
+/// Writes the largest saved IA32_TSC into every vCPU state and returns how far
+/// apart the saved values were (max - min, in TSC cycles).
+///
+/// Each vCPU thread reads its own IA32_TSC while a snapshot is taken, so the
+/// saved values differ by however long the slowest thread took to answer. KVM
+/// gives vCPUs one TSC offset only when userspace writes their TSCs within one
+/// second of each other (`kvm_synchronize_tsc`); a save stretched past that
+/// restores into a VM whose vCPUs disagree on the time, and a guest on the TSC
+/// clocksource then sees CLOCK_MONOTONIC go backwards across vCPUs (Erlang
+/// aborts with "OS monotonic time stepped backwards"). Every later restore of
+/// such a snapshot replays the gap. The VM is paused for the whole save, so no
+/// guest code observed any value between the smallest and the largest saved
+/// TSC: moving every vCPU to the largest keeps each vCPU's TSC monotonic and
+/// hands KVM one value to synchronize on.
+pub fn unify_saved_tsc(states: &mut [VcpuState]) -> u64 {
+    let tscs = saved_tscs(states);
+    let found = spread(&tscs);
+    if let Some(max) = tscs.iter().copied().max().filter(|_| found > 0) {
+        for state in states.iter_mut() {
+            for msrs in state.saved_msrs.iter_mut() {
+                for msr in msrs.as_mut_slice().iter_mut() {
+                    if msr.index == MSR_IA32_TSC {
+                        msr.data = max;
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Run after every vCPU's state is restored and before any vCPU runs. When the
+/// vCPUs' TSCs are more than `tolerance` cycles apart (KVM put them in
+/// different offset generations because their IA32_TSC writes landed more than
+/// a second apart, e.g. the restoring thread stalled), writes the largest TSC
+/// to every vCPU back to back, which KVM synchronizes into one offset, then
+/// re-primes each vCPU's TSC deadline timer. The guest has not run since the
+/// restore began, so moving a vCPU's TSC here is invisible to it.
+///
+/// Returns the spread found and the spread left, both in TSC cycles.
+pub fn unify_restored_tsc(
+    vcpus: &[&KvmVcpu],
+    states: &[VcpuState],
+    tolerance: u64,
+) -> Result<(u64, u64), KvmVcpuError> {
+    let read =
+        || -> Result<Vec<u64>, KvmVcpuError> { vcpus.iter().map(|vcpu| vcpu.get_tsc()).collect() };
+    let tscs = read()?;
+    let found = spread(&tscs);
+    if found <= tolerance {
+        return Ok((found, found));
+    }
+    let target = tscs.iter().copied().max().unwrap_or_default();
+    for vcpu in vcpus {
+        vcpu.set_tsc(target)?;
+    }
+    for (vcpu, state) in vcpus.iter().zip(states) {
+        vcpu.restore_deferred_msrs(state)?;
+    }
+    Ok((found, spread(&read()?)))
 }
 
 impl Peripherals {
@@ -882,6 +1012,71 @@ mod tests {
         vm.setup_irqchip().unwrap();
         let vcpu = KvmVcpu::new(0, &vm).unwrap();
         (vm, vcpu)
+    }
+
+    fn state_with_tsc(tsc: u64) -> VcpuState {
+        let msr = |index, data| kvm_msr_entry {
+            index,
+            data,
+            ..Default::default()
+        };
+        VcpuState {
+            saved_msrs: vec![
+                Msrs::from_entries(&[msr(0x277, 6), msr(MSR_IA32_TSC, tsc)]).unwrap(),
+                Msrs::from_entries(&[msr(MSR_IA32_TSC_DEADLINE, tsc + 10)]).unwrap(),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_unify_saved_tsc() {
+        // Seen in production: vCPU 0's TSC was read 7_020_621_266 cycles (1.64 s
+        // at 4.29 GHz) after vCPUs 1-7's, and every restore of that snapshot
+        // split the VM.
+        let base = 0x0004_0B44_E9C1_B74F;
+        let gap = 7_020_621_266;
+        let mut states: Vec<VcpuState> = std::iter::once(state_with_tsc(base + gap))
+            .chain((1..8).map(|_| state_with_tsc(base)))
+            .collect();
+
+        assert_eq!(unify_saved_tsc(&mut states), gap);
+        assert_eq!(saved_tscs(&states), vec![base + gap; 8]);
+        // Only IA32_TSC moves: PAT and the saved TSC deadline stay as saved.
+        assert_eq!(states[1].saved_msrs[0].as_slice()[0].data, 6);
+        assert_eq!(states[1].saved_msrs[1].as_slice()[0].data, base + 10);
+
+        // A snapshot whose vCPUs already agree is left as it is.
+        assert_eq!(unify_saved_tsc(&mut states), 0);
+        assert_eq!(saved_tscs(&states), vec![base + gap; 8]);
+
+        // A state without an IA32_TSC record is not touched.
+        let mut no_tsc = vec![VcpuState::default(), VcpuState::default()];
+        assert_eq!(unify_saved_tsc(&mut no_tsc), 0);
+    }
+
+    #[test]
+    fn test_unify_restored_tsc() {
+        // Two vCPUs whose IA32_TSC writes land more than KVM's one-second
+        // synchronization window apart get different TSC offsets.
+        let vm = setup_vm_with_memory(0x10000);
+        vm.setup_irqchip().unwrap();
+        let vcpu0 = KvmVcpu::new(0, &vm).unwrap();
+        let vcpu1 = KvmVcpu::new(1, &vm).unwrap();
+        let tsc_khz = u64::from(vcpu0.get_tsc_khz().unwrap());
+        let start = vcpu0.get_tsc().unwrap();
+        vcpu0.set_tsc(start).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1_200));
+        vcpu1.set_tsc(start).unwrap();
+
+        let states = vec![state_with_tsc(start), state_with_tsc(start)];
+        let (found, left) = unify_restored_tsc(&[&vcpu0, &vcpu1], &states, tsc_khz).unwrap();
+
+        assert!(found > tsc_khz * 1_000, "split was {found} cycles");
+        assert!(left <= tsc_khz, "still {left} cycles apart");
+        // Nothing to do the second time.
+        let (found, left) = unify_restored_tsc(&[&vcpu0, &vcpu1], &states, tsc_khz).unwrap();
+        assert!(found <= tsc_khz && left == found);
     }
 
     fn configure_vcpu(
